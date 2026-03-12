@@ -1,0 +1,6 @@
+{
+  "name": "pps-v3-final",
+  "version": "3.1.0",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "express": "^4.18.2", "node-fetch": "^2.7.0" }
+}
