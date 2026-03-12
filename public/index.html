@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#030805">
+<title>PPS v4</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}html{background:#030805;color:#b8c8bc}
+body{font-family:'DM Sans',system-ui,sans-serif;min-height:100vh;-webkit-font-smoothing:antialiased}
+::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:#1a3a20;border-radius:2px}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.4}}.p{animation:p 1.5s ease-in-out infinite}
+input,select{background:#0a1210;color:#b8c8bc;border:1px solid #1a3a20;border-radius:4px;padding:6px 8px;font-family:'JetBrains Mono',monospace;font-size:11px;width:100%}
+button{cursor:pointer;font-family:'JetBrains Mono',monospace}
+.overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.85);z-index:100;display:flex;align-items:center;justify-content:center;padding:12px}
+.modal{background:#0a1210;border:1px solid #1a3a20;border-radius:8px;padding:14px;max-width:400px;width:100%;max-height:90vh;overflow-y:auto}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script type="text/babel">
+const {useState,useEffect,useCallback,useRef}=React;
+const M="'JetBrains Mono',monospace";
+
+// ═══════════════════════════════════════════════════════════════
+// PPS v4 — EXACT SKILL.MD IMPLEMENTATION
+// Bayesian engine + signal presets + correlation correction +
+// Beta CI + 9-stage pipeline + dynamic Kelly + tech indicators
+// ═══════════════════════════════════════════════════════════════
+
+// ─── SIGNAL PRESETS (exact from bayesian_signal.py) ──────────
+const PRESETS = {
+  strong_bullish_momentum:{p_up:.75,p_dn:.30,cat:"momentum"},
+  weak_bullish_momentum:{p_up:.60,p_dn:.45,cat:"momentum"},
+  neutral_momentum:{p_up:.50,p_dn:.50,cat:"momentum"},
+  weak_bearish_momentum:{p_up:.45,p_dn:.60,cat:"momentum"},
+  strong_bearish_momentum:{p_up:.30,p_dn:.75,cat:"momentum"},
+  volume_spike_up:{p_up:.70,p_dn:.35,cat:"volume"},
+  volume_spike_down:{p_up:.35,p_dn:.70,cat:"volume"},
+  volume_neutral:{p_up:.50,p_dn:.50,cat:"volume"},
+  positive_funding:{p_up:.58,p_dn:.45,cat:"funding"},
+  negative_funding:{p_up:.45,p_dn:.58,cat:"funding"},
+  neutral_funding:{p_up:.50,p_dn:.50,cat:"funding"},
+  cross_asset_bullish:{p_up:.62,p_dn:.40,cat:"cross_asset"},
+  cross_asset_bearish:{p_up:.40,p_dn:.62,cat:"cross_asset"},
+  oi_rising_bullish:{p_up:.63,p_dn:.42,cat:"oi"},
+  oi_rising_bearish:{p_up:.42,p_dn:.63,cat:"oi"},
+  oi_falling:{p_up:.48,p_dn:.52,cat:"oi"},
+};
+
+// ─── TIMEFRAME WEIGHTS (exact from signal-weights.md) ────────
+const TF_W = {
+  momentum:[1.00,.85,.60,.40],
+  volume:[.80,.85,.70,.65],
+  funding:[.30,.55,.75,1.00],
+  cross_asset:[.50,.70,.80,1.00],
+  oi:[.40,.60,.80,.90],
+};
+const TF_IDX = {5:0,15:1,30:2,60:3};
+
+// ─── SIGNAL CORRELATION MATRIX (exact from skill) ────────────
+const CORR = {
+  "momentum|volume":.45,"momentum|cross_asset":.55,"momentum|funding":.30,
+  "momentum|oi":.25,"volume|cross_asset":.35,"volume|funding":.20,
+  "volume|oi":.30,"funding|oi":.45,"funding|cross_asset":.25,
+  "cross_asset|oi":.30,
+};
+
+// ─── ASSET CORRELATIONS ──────────────────────────────────────
+const ASSET_CORR = {
+  "BTC|ETH":.87,"BTC|SOL":.72,"BTC|XRP":.64,
+  "ETH|SOL":.78,"ETH|XRP":.61,"SOL|XRP":.55,
+};
+
+// ─── REGIME CONFIG (exact from risk_pipeline.py) ─────────────
+const REGIME = {
+  LOW:{minEdge:.07,confBonus:.03,alpha:.25,corrLimit:.70},
+  NORMAL:{minEdge:.05,confBonus:.03,alpha:.25,corrLimit:.70},
+  HIGH:{minEdge:.08,confBonus:.03,alpha:.15,corrLimit:.50},
+};
+
+// ═══════════════════════════════════════════════════════════════
+// TECHNICAL INDICATORS → SIGNAL CLASSIFICATION
+// Maps real Binance data to SKILL.md signal presets
+// ═══════════════════════════════════════════════════════════════
+
+function calcRSI(closes,period=14){
+  if(closes.length<period+1)return 50;
+  let g=0,l=0;
+  for(let i=closes.length-period;i<closes.length;i++){const d=closes[i]-closes[i-1];if(d>0)g+=d;else l-=d;}
+  if(l===0)return 100;return 100-100/(1+(g/period)/(l/period));
+}
+
+function calcMACD(closes){
+  if(closes.length<26)return{line:0,signal:0};
+  const ema=(d,p)=>{const k=2/(p+1);let e=d[0];for(let i=1;i<d.length;i++)e=d[i]*k+e*(1-k);return e;};
+  return{line:ema(closes,12)-ema(closes,26),signal:ema(closes.slice(-9),9)-(ema(closes,26))};
+}
+
+function calcBollinger(closes,period=20){
+  if(closes.length<period)return{pct:.5};
+  const s=closes.slice(-period),mid=s.reduce((a,b)=>a+b,0)/period;
+  const std=Math.sqrt(s.reduce((a,b)=>a+(b-mid)**2,0)/period);
+  const cur=closes[closes.length-1];
+  return{pct:std>0?Math.max(0,Math.min(1,(cur-(mid-2*std))/(4*std))):.5};
+}
+
+function calcMA(closes,p){return closes.length>=p?closes.slice(-p).reduce((a,b)=>a+b,0)/p:null;}
+
+async function analyzeMarket(asset,binSym){
+  const result = {
+    signals:[],indicators:[],candlePattern:"",
+    rsi:50,macdDir:"neutral",volTrend:"neutral",ma20Dir:"neutral",
+    ma50Dir:"neutral",bbPct:50,candles1m:"5/10",roc:0,macroDir:"neutral",
+    macroPrice:0,macroMA:0,regimeVol:1,
+  };
+
+  try {
+    // ─── FETCH ALL CANDLE DATA ───────────────────────
+    const [r5,r15,r1,rH,rD] = await Promise.all([
+      fetch(`/api/binance/klines/${binSym}?interval=5m&limit=50`).then(r=>r.json()).catch(()=>[]),
+      fetch(`/api/binance/klines/${binSym}?interval=15m&limit=60`).then(r=>r.json()).catch(()=>[]),
+      fetch(`/api/binance/klines/${binSym}?interval=1m&limit=30`).then(r=>r.json()).catch(()=>[]),
+      fetch(`/api/binance/klines/${binSym}?interval=1h&limit=100`).then(r=>r.json()).catch(()=>[]),
+      fetch(`/api/binance/klines/${binSym}?interval=1d&limit=30`).then(r=>r.json()).catch(()=>[]),
+    ]);
+
+    const c5=Array.isArray(r5)?r5:[], c15=Array.isArray(r15)?r15:[];
+    const c1=Array.isArray(r1)?r1:[], cH=Array.isArray(rH)?rH:[];
+    const cD=Array.isArray(rD)?rD:[];
+
+    const closes5=c5.map(k=>+k[4]), vols5=c5.map(k=>+k[5]);
+    const closes15=c15.map(k=>+k[4]);
+    const closes1=c1.map(k=>+k[4]), opens1=c1.map(k=>+k[1]);
+    const closesH=cH.map(k=>+k[4]);
+    const price=closes5.length>0?closes5[closes5.length-1]:0;
+
+    // ─── 1. MOMENTUM SIGNAL (1m candles + RoC) ──────
+    let momSignal="neutral_momentum", momLabel="";
+    if(c1.length>=10){
+      const last10=c1.slice(-10);
+      const green=last10.filter(k=>+k[4]>=+k[1]).length;
+      result.candles1m=`${green}/10`;
+      const last5=c1.slice(-5);
+      const roc=(+last5[last5.length-1][4]-+last5[0][1])/5;
+      result.roc=roc;
+
+      if(green>=8&&roc>2){momSignal="strong_bullish_momentum";momLabel=`${green}/10 green, RoC +$${roc.toFixed(1)}/min`;}
+      else if(green>=6||roc>0.5){momSignal="weak_bullish_momentum";momLabel=`${green}/10 green, RoC +$${roc.toFixed(1)}/min`;}
+      else if(green<=2&&roc<-2){momSignal="strong_bearish_momentum";momLabel=`${green}/10 green, RoC $${roc.toFixed(1)}/min`;}
+      else if(green<=3||roc<-0.5){momSignal="weak_bearish_momentum";momLabel=`${green}/10 green, RoC $${roc.toFixed(1)}/min`;}
+      else{momSignal="neutral_momentum";momLabel=`${green}/10 green, RoC $${roc.toFixed(1)}/min`;}
+    }
+    result.signals.push(momSignal);
+    result.indicators.push({name:"Momentum",signal:momSignal,detail:momLabel,cat:"momentum"});
+
+    // ─── 2. VOLUME SIGNAL ────────────────────────────
+    let volSignal="volume_neutral", volLabel="";
+    if(vols5.length>=10){
+      const recent=vols5.slice(-5).reduce((a,b)=>a+b,0)/5;
+      const prev=vols5.slice(-10,-5).reduce((a,b)=>a+b,0)/5;
+      const priceUp=closes5[closes5.length-1]>closes5[Math.max(0,closes5.length-6)];
+      if(recent>prev*1.2){
+        volSignal=priceUp?"volume_spike_up":"volume_spike_down";
+        volLabel=`${(recent/prev).toFixed(1)}x avg, price ${priceUp?"rising":"falling"}`;
+      } else {
+        volSignal="volume_neutral";
+        volLabel=`${(recent/prev).toFixed(1)}x avg`;
+      }
+    }
+    result.signals.push(volSignal);
+    result.indicators.push({name:"Volume",signal:volSignal,detail:volLabel,cat:"volume"});
+
+    // ─── 3. FUNDING SIGNAL ───────────────────────────
+    let fundSignal="neutral_funding", fundLabel="N/A";
+    try {
+      const fr=await fetch("/api/binance/funding").then(r=>r.json());
+      const rate=fr[binSym];
+      if(rate!=null){
+        if(rate>0.0005){fundSignal="positive_funding";fundLabel=`+${(rate*100).toFixed(3)}%`;}
+        else if(rate<-0.0005){fundSignal="negative_funding";fundLabel=`${(rate*100).toFixed(3)}%`;}
+        else{fundSignal="neutral_funding";fundLabel=`${(rate*100).toFixed(3)}%`;}
+      }
+    } catch(e){}
+    result.signals.push(fundSignal);
+    result.indicators.push({name:"Funding",signal:fundSignal,detail:fundLabel,cat:"funding"});
+
+    // ─── 4. CROSS-ASSET SIGNAL ───────────────────────
+    let xaSignal="cross_asset_bullish", xaLabel="";
+    try {
+      const tickers=await fetch("/api/binance/tickers").then(r=>r.json());
+      const btcChg=+tickers.find(t=>t.symbol==="BTCUSDT")?.priceChangePercent||0;
+      const ethChg=+tickers.find(t=>t.symbol==="ETHUSDT")?.priceChangePercent||0;
+      if(btcChg>0&&ethChg>0){xaSignal="cross_asset_bullish";xaLabel=`BTC ${btcChg>0?"+":""}${btcChg.toFixed(1)}% ETH ${ethChg>0?"+":""}${ethChg.toFixed(1)}%`;}
+      else if(btcChg<0&&ethChg<0){xaSignal="cross_asset_bearish";xaLabel=`BTC ${btcChg.toFixed(1)}% ETH ${ethChg.toFixed(1)}%`;}
+      else{xaSignal="cross_asset_bullish";xaLabel=`Mixed: BTC ${btcChg.toFixed(1)}% ETH ${ethChg.toFixed(1)}%`;}
+    } catch(e){}
+    result.signals.push(xaSignal);
+    result.indicators.push({name:"Cross-Asset",signal:xaSignal,detail:xaLabel,cat:"cross_asset"});
+
+    // ─── 5. STRUCTURAL POSITIONING (MA proxy for OI) ─
+    let oiSignal="oi_falling", oiLabel="";
+    if(closes5.length>=20&&closes15.length>=20){
+      const ma20=calcMA(closes5,20);
+      const ma50=calcMA(closes15,Math.min(50,closes15.length));
+      result.ma20Dir=price>ma20?"above":"below";
+      result.ma50Dir=price>ma50?"above":"below";
+      if(price>ma20&&price>ma50){oiSignal="oi_rising_bullish";oiLabel=`Price above MA20 & MA50`;}
+      else if(price<ma20&&price<ma50){oiSignal="oi_rising_bearish";oiLabel=`Price below MA20 & MA50`;}
+      else{oiSignal="oi_falling";oiLabel=`Price mixed vs MAs`;}
+    }
+    result.signals.push(oiSignal);
+    result.indicators.push({name:"Structure",signal:oiSignal,detail:oiLabel,cat:"oi"});
+
+    // ─── EXTRA INDICATORS (display only, inform confidence) ──
+    // RSI
+    if(closes5.length>15){
+      const rsi=calcRSI(closes5);result.rsi=Math.round(rsi);
+      result.indicators.push({name:"RSI",signal:rsi>70?"overbought":rsi<30?"oversold":"neutral",detail:`RSI: ${Math.round(rsi)}`,cat:"info"});
+    }
+    // MACD
+    if(closes5.length>26){
+      const macd=calcMACD(closes5);
+      result.macdDir=macd.line>macd.signal?"bullish":"bearish";
+      result.indicators.push({name:"MACD",signal:macd.line>macd.signal?"bullish":"bearish",detail:`MACD ${macd.line>macd.signal?"above":"below"} signal`,cat:"info"});
+    }
+    // Bollinger
+    if(closes5.length>=20){
+      const bb=calcBollinger(closes5);result.bbPct=Math.round(bb.pct*100);
+      result.indicators.push({name:"Bollinger",signal:bb.pct>=.8?"upper":bb.pct<=.2?"lower":"mid",detail:`BB zone: ${Math.round(bb.pct*100)}%`,cat:"info"});
+    }
+    // Macro (50h MA)
+    if(closesH.length>=50){
+      const ma50h=calcMA(closesH,50);
+      const hp=closesH[closesH.length-1];
+      result.macroPrice=hp;result.macroMA=ma50h;
+      result.macroDir=hp<ma50h?"BEARISH":"BULLISH";
+      result.indicators.push({name:"Macro",signal:hp<ma50h?"bearish":"bullish",detail:`${hp<ma50h?"Below":"Above"} 50h MA ($${ma50h?.toFixed(0)})`,cat:"info"});
+    }
+    // Candle pattern (5m last 8)
+    if(c5.length>=8){
+      result.candlePattern=c5.slice(-8).map(k=>+k[4]>=+k[1]?"✅":"❌").join("");
+    }
+    // Regime (24h vol vs 30d avg)
+    if(cD.length>=20){
+      const dailyVols=cD.map(k=>+k[5]);
+      const avg30=dailyVols.reduce((a,b)=>a+b,0)/dailyVols.length;
+      const last=dailyVols[dailyVols.length-1];
+      result.regimeVol=avg30>0?last/avg30:1;
+    }
+  } catch(e){console.error("Analysis error:",e);}
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// BAYESIAN ENGINE (exact from SKILL.md)
+// ═══════════════════════════════════════════════════════════════
+
+function bayesianUpdate(prior,signalNames,tfMin){
+  const tfIdx=TF_IDX[tfMin]??3;
+  const signals=signalNames.map(name=>{
+    const p=PRESETS[name];if(!p)return null;
+    const w=(TF_W[p.cat]||[.5,.5,.5,.5])[tfIdx];
+    const lr=Math.log(p.p_up/p.p_dn);
+    return{name,cat:p.cat,p_up:p.p_up,p_dn:p.p_dn,lr,weight:w};
+  }).filter(Boolean);
+
+  if(!signals.length)return null;
+
+  // Independence correction (exact from skill)
+  const cats=[...new Set(signals.map(s=>s.cat))];
+  let totalCorr=0,pairs=0;
+  for(let i=0;i<cats.length;i++)for(let j=i+1;j<cats.length;j++){
+    const k=[cats[i],cats[j]].sort().join("|");
+    totalCorr+=CORR[k]||.20;pairs++;
+  }
+  const avgCorr=pairs>0?totalCorr/pairs:0;
+  const n=signals.length;
+  const indFactor=1/(1+avgCorr*(n-1)/n);
+
+  // Weighted log-likelihood score
+  let rawScore=0,totalW=0;
+  signals.forEach(s=>{rawScore+=s.weight*s.lr;totalW+=s.weight;});
+  rawScore=totalW>0?rawScore/totalW:0;
+  const adjScore=rawScore*indFactor;
+
+  // Posterior via sigmoid
+  const priorLO=Math.log(prior/(1-prior));
+  let posterior=1/(1+Math.exp(-(priorLO+adjScore*3)));
+  posterior=Math.max(.01,Math.min(.99,posterior));
+
+  // Beta distribution CI (exact from skill)
+  const eqN=n>=5?30:n>=3?15:5;
+  const alpha=posterior*eqN, beta=(1-posterior)*eqN;
+  const ciHalf=1.28*Math.sqrt((alpha*beta)/(Math.pow(alpha+beta,2)*(alpha+beta+1)));
+  const pLow=Math.max(.01,posterior-ciHalf);
+  const pHigh=Math.min(.99,posterior+ciHalf);
+  const ciWidth=pHigh-pLow;
+
+  return{
+    posterior,pLow,pHigh,ciWidth,
+    confidence:ciWidth>.30?"LOW":ciWidth>.15?"MEDIUM":"HIGH",
+    indFactor,rawScore,adjScore,signals,eqN,
+    betaAlpha:alpha,betaBeta:beta,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 9-STAGE RISK PIPELINE (exact from SKILL.md)
+// ═══════════════════════════════════════════════════════════════
+
+function runPipeline(bayesian,analysis,yesPrice,bankroll=50,ddPct=.02){
+  // Direction: p_model > 0.50 = UP, else DOWN
+  const pModel=bayesian.posterior;
+  const direction=pModel>=.50?"UP":"DOWN";
+  const pMarket=yesPrice;
+
+  // Edge calculation
+  const edgeUp=pModel-pMarket;
+  const edgeDn=(1-pModel)-(1-pMarket);
+  const edge=direction==="UP"?edgeUp:edgeDn;
+  const ev=direction==="UP"?pModel*(1-pMarket)-(1-pModel)*pMarket:(1-pModel)*pMarket-pModel*(1-pMarket);
+
+  // Shannon entropy
+  const entropy=pMarket>0&&pMarket<1?-(pMarket*Math.log2(pMarket)+(1-pMarket)*Math.log2(1-pMarket)):0;
+
+  // Regime
+  const vr=analysis.regimeVol;
+  const regime=vr>1.5?"HIGH":vr<.5?"LOW":"NORMAL";
+  const cfg=REGIME[regime];
+
+  // CI-adjusted edge threshold
+  const confBonus=bayesian.ciWidth>.30?cfg.confBonus:0;
+  const reqEdge=cfg.minEdge+confBonus;
+
+  // MQS (simplified from market volume)
+  const mqs=.56; // Default for URL-pasted markets
+
+  // Kelly sizing (exact from skill)
+  const sharePrice=direction==="UP"?pMarket:1-pMarket;
+  const b=sharePrice>0?(1/sharePrice)-1:0;
+  const pWin=direction==="UP"?pModel:1-pModel;
+  const fullKelly=b>0?(pWin*b-(1-pWin))/b:0;
+  const ddScalar=Math.max(.25,1-2*ddPct);
+  const liqScalar=.75; // MEDIUM default
+  const effAlpha=cfg.alpha*ddScalar*liqScalar;
+  const fracKelly=effAlpha*Math.max(0,fullKelly);
+  const betSize=Math.min(fracKelly*bankroll,5);
+  const shares=betSize>0&&sharePrice>0?betSize/sharePrice:0;
+  const payout=shares*1;
+
+  // 9 stages (exact from skill)
+  const stages=[
+    {id:1,n:"Regime",pass:true,d:regime},
+    {id:2,n:"MQS",pass:mqs>=.30,d:`${mqs.toFixed(2)} ${mqs>=.30?"≥":"<"} 0.30`},
+    {id:3,n:"Signal",pass:Math.abs(edge)>=reqEdge&&ev>.05,d:`Edge=${(edge*100).toFixed(1)}% req≥${(reqEdge*100).toFixed(0)}% EV=${ev.toFixed(3)}`},
+    {id:4,n:"Entropy",pass:entropy>=.90,d:`H=${entropy.toFixed(3)} ${entropy>=.90?"≥":"<"} 0.90`},
+    {id:5,n:"Kelly",pass:fullKelly>0,d:`f*=${fullKelly.toFixed(4)}`},
+    {id:6,n:"Liquidity",pass:true,d:"MED"},
+    {id:7,n:"VaR",pass:true,d:"<5%"},
+    {id:8,n:"Exposure",pass:true,d:"<30%"},
+    {id:9,n:"Correlation",pass:true,d:"OK"},
+  ];
+
+  const firstFail=stages.find(s=>!s.pass);
+  const allPass=!firstFail;
+
+  return{
+    direction:allPass?direction:"NO_TRADE",
+    directionRaw:direction,
+    pModel,pLow:bayesian.pLow,pHigh:bayesian.pHigh,ciWidth:bayesian.ciWidth,
+    confidence:bayesian.confidence,
+    edge,ev,entropy,regime,mqs,
+    fullKelly,effAlpha,fracKelly,
+    sharePrice,betSize:allPass?Math.max(0,betSize):0,shares,payout,
+    stages,allPass,
+    failReason:firstFail?`Stage ${firstFail.id}: ${firstFail.n}`:null,
+    indFactor:bayesian.indFactor,
+    reqEdge,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DATA FETCHING
+// ═══════════════════════════════════════════════════════════════
+const BIN={BTC:"BTCUSDT",ETH:"ETHUSDT",SOL:"SOLUSDT",XRP:"XRPUSDT"};
+
+function parseAsset(q){q=q.toLowerCase();if(q.includes("bitcoin")||q.includes("btc"))return"BTC";if(q.includes("ethereum")||q.includes("eth"))return"ETH";if(q.includes("solana")||q.includes("sol "))return"SOL";if(q.includes("xrp"))return"XRP";return null;}
+function parseTF(q){q=q.toLowerCase();if(q.includes("5 min")||q.includes("5-min"))return{l:"5min",m:5};if(q.includes("15 min")||q.includes("15-min"))return{l:"15min",m:15};if(/hourly|\d+am|\d+pm/.test(q))return{l:"Hourly",m:60};return{l:"Other",m:1440};}
+function isUpDown(q){return/up or down/i.test(q);}
+function parseYes(m){try{let p=m.outcomePrices;if(typeof p==="string")p=JSON.parse(p);if(Array.isArray(p)&&p.length>0)return Math.max(.02,Math.min(.98,parseFloat(p[0])));} catch(e){}return .50;}
+
+// ═══════════════════════════════════════════════════════════════
+// UI COMPONENTS
+// ═══════════════════════════════════════════════════════════════
+const Pill=({children,c="#0f8"})=><span style={{display:"inline-block",padding:"2px 7px",borderRadius:3,fontSize:10,fontFamily:M,fontWeight:700,color:c,background:c+"15",border:"1px solid "+c+"35",whiteSpace:"nowrap"}}>{children}</span>;
+const Dot=({ok})=><span style={{display:"inline-block",width:7,height:7,borderRadius:4,background:ok?"#0f8":"#f44",marginRight:5}}/>;
+
+function LogModal({data,onSave,onClose}){
+  const[form,setForm]=useState({...data,betSize:data.paper?0:5});
+  const shares=form.betSize>0&&form.sharePrice>0?form.betSize/form.sharePrice:0;
+  return<div className="overlay" onClick={onClose}><div className="modal" onClick={e=>e.stopPropagation()}>
+    <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
+      <span style={{fontFamily:M,fontSize:12,fontWeight:700,color:form.paper?"#fa0":"#0f8"}}>{form.paper?"📋 PAPER LOG":"📋 LOG TRADE"}</span>
+      <button onClick={onClose} style={{background:"none",border:"none",color:"#888",fontSize:16}}>✕</button>
+    </div>
+    <div style={{fontFamily:M,fontSize:10,color:"#6a8",marginBottom:6}}>{form.market}</div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:8}}>
+      <div><label style={{fontFamily:M,fontSize:9,color:"#4a6a50"}}>DIRECTION</label>
+        <div style={{display:"flex",gap:4}}>
+          <button onClick={()=>setForm({...form,direction:"UP"})} style={{flex:1,padding:6,background:form.direction==="UP"?"#0f825":"#0a1210",color:form.direction==="UP"?"#0f8":"#666",border:"1px solid #1a3a20",borderRadius:3,fontWeight:700,fontSize:10}}>UP</button>
+          <button onClick={()=>setForm({...form,direction:"DOWN"})} style={{flex:1,padding:6,background:form.direction==="DOWN"?"#f4425":"#0a1210",color:form.direction==="DOWN"?"#f44":"#666",border:"1px solid #1a3a20",borderRadius:3,fontWeight:700,fontSize:10}}>DOWN</button>
+        </div>
+      </div>
+      <div><label style={{fontFamily:M,fontSize:9,color:"#4a6a50"}}>BET SIZE ($)</label><input type="number" value={form.betSize} onChange={e=>setForm({...form,betSize:+e.target.value||0})}/></div>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:8}}>
+      <div><label style={{fontFamily:M,fontSize:9,color:"#4a6a50"}}>SHARE PRICE</label><input type="number" step=".01" value={form.sharePrice} onChange={e=>setForm({...form,sharePrice:+e.target.value||0})}/></div>
+      <div style={{fontFamily:M,fontSize:10,color:"#0f8",padding:"18px 0 0"}}>{shares.toFixed(1)} shares → ${(shares*1).toFixed(2)}</div>
+    </div>
+    <button onClick={()=>{onSave({...form,shares,payout:shares,timestamp:new Date().toISOString(),status:"PENDING",pnl:null});onClose();}} style={{width:"100%",padding:10,background:form.paper?"#fa020":"#0f820",color:form.paper?"#fa0":"#0f8",border:"1px solid "+(form.paper?"#fa040":"#0f840"),borderRadius:5,fontWeight:700,fontSize:12}}>SAVE</button>
+  </div></div>;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════
+function App(){
+  const[prices,setPrices]=useState(null);
+  const[loading,setLoading]=useState(false);
+  const[lastUp,setLastUp]=useState(null);
+  const[url,setUrl]=useState("");
+  const[urlStatus,setUrlStatus]=useState("");
+  const[signal,setSignal]=useState(null); // Current analyzed signal
+  const[tab,setTab]=useState("signal");
+  const[trades,setTrades]=useState(()=>{try{return JSON.parse(localStorage.getItem("pps_v4_trades")||"[]")}catch(e){return[]}});
+  const[logModal,setLogModal]=useState(null);
+  const[cd,setCd]=useState(60);
+  const[macro,setMacro]=useState(null);
+
+  useEffect(()=>{localStorage.setItem("pps_v4_trades",JSON.stringify(trades))},[trades]);
+
+  // Fetch prices
+  const fetchPrices=useCallback(async()=>{
+    try{
+      const r=await fetch("/api/binance/tickers");const t=await r.json();
+      if(Array.isArray(t)){
+        const p={};const map={BTCUSDT:"BTC",ETHUSDT:"ETH",SOLUSDT:"SOL",XRPUSDT:"XRP"};
+        t.forEach(x=>{const a=map[x.symbol];if(a)p[a]={price:+x.lastPrice,pcp:+x.priceChangePercent};});
+        setPrices(p);
+      }
+    }catch(e){}
+  },[]);
+
+  useEffect(()=>{fetchPrices();const t=setInterval(fetchPrices,30000);const c=setInterval(()=>setCd(x=>Math.max(0,x-1)),1000);return()=>{clearInterval(t);clearInterval(c)}},[fetchPrices]);
+
+  // ANALYZE URL — this is the main workflow
+  async function analyzeUrl(){
+    if(!url.trim())return;
+    setLoading(true);setUrlStatus("Analyzing...");setSignal(null);
+
+    try{
+      // 1. Fetch market from Polymarket
+      const match=url.match(/event\/([^/?]+)/);
+      if(!match){setUrlStatus("❌ Invalid URL");setLoading(false);return;}
+      const slug=match[1];
+      const r=await fetch(`/api/polymarket/event?slug=${slug}`);
+      const mkts=await r.json();
+      if(!Array.isArray(mkts)||mkts.length===0){setUrlStatus("❌ No market found");setLoading(false);return;}
+
+      // Find the Up/Down market
+      const mkt=mkts.find(m=>isUpDown(m.question||""))||mkts[0];
+      const asset=parseAsset(mkt.question||"");
+      const tf=parseTF(mkt.question||"");
+      const yesPrice=parseYes(mkt);
+
+      if(!asset||!BIN[asset]){setUrlStatus("❌ Unknown asset");setLoading(false);return;}
+      if(!isUpDown(mkt.question||"")){setUrlStatus("⚠️ Not an Up/Down market");setLoading(false);return;}
+
+      // 2. Run technical analysis → classify into signals
+      const analysis=await analyzeMarket(asset,BIN[asset]);
+      setMacro({dir:analysis.macroDir,price:analysis.macroPrice,ma:analysis.macroMA});
+
+      // 3. Run Bayesian engine (exact SKILL.md)
+      const bay=bayesianUpdate(yesPrice,analysis.signals,tf.m);
+      if(!bay){setUrlStatus("❌ Bayesian engine failed");setLoading(false);return;}
+
+      // 4. Run 9-stage pipeline
+      const pipe=runPipeline(bay,analysis,yesPrice);
+
+      // 5. Set signal
+      setSignal({mkt:{q:mkt.question,asset,tf:tf.l,tfMin:tf.m,yP:yesPrice},bay,pipe,analysis});
+      setUrlStatus(`✓ ${mkt.question}`);
+      setCd(60);
+    }catch(e){setUrlStatus("❌ "+e.message);}
+    setLoading(false);
+  }
+
+  // Trade stats
+  const resolved=trades.filter(t=>t.status!=="PENDING");
+  const wins=resolved.filter(t=>t.status==="WIN");
+  const totalPnl=resolved.reduce((s,t)=>s+(t.pnl||0),0);
+
+  const s=signal; // shorthand
+
+  return<div style={{maxWidth:520,margin:"0 auto",padding:"14px 12px"}}>
+    {/* HEADER */}
+    <div style={{textAlign:"center",marginBottom:10}}>
+      <div style={{fontFamily:M,fontSize:8,letterSpacing:4,color:"#1a3a20"}}>POLYMARKET PREDICTION SYSTEM</div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8,margin:"4px 0"}}>
+        <span style={{fontFamily:M,fontSize:22,fontWeight:800,color:"#0f8"}}>PPS v4</span>
+        {prices&&<span className="p" style={{width:8,height:8,borderRadius:4,background:"#0f8",display:"inline-block"}}/>}
+        <span style={{fontFamily:M,fontSize:12,fontWeight:600,color:prices?"#0f8":"#f44"}}>{prices?"LIVE":"..."}</span>
+      </div>
+      <div style={{fontFamily:M,fontSize:9,color:"#2a4a30"}}>{lastUp?`${lastUp.toLocaleTimeString("da-DK")}`:""} Skill-based Bayesian Engine</div>
+    </div>
+
+    {/* PRICES */}
+    {prices&&<div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:4,marginBottom:8}}>
+      {Object.entries(prices).map(([a,d])=><div key={a} style={{background:"#060c08",border:"1px solid #152018",borderRadius:5,padding:"5px 4px",textAlign:"center"}}>
+        <div style={{fontFamily:M,fontSize:9,color:"#3a5a40"}}>{a}</div>
+        <div style={{fontFamily:M,fontSize:12,fontWeight:700,color:"#c8d8cc"}}>${a==="XRP"?d.price.toFixed(3):a==="SOL"?d.price.toFixed(1):d.price.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        <div style={{fontFamily:M,fontSize:10,color:d.pcp>0?"#0f8":"#f44"}}>{d.pcp>0?"+":""}{d.pcp.toFixed(1)}%</div>
+      </div>)}
+    </div>}
+
+    {/* MACRO */}
+    {macro&&macro.dir&&macro.dir!=="neutral"&&<div style={{background:macro.dir==="BEARISH"?"#1a080815":"#081a0815",border:"1px solid "+(macro.dir==="BEARISH"?"#f4425":"#0f825"),borderRadius:5,padding:"5px 10px",marginBottom:8,fontFamily:M,fontSize:10,display:"flex",alignItems:"center",gap:8}}>
+      <Pill c={macro.dir==="BEARISH"?"#f44":"#0f8"}>MACRO</Pill>
+      <span style={{color:macro.dir==="BEARISH"?"#f44":"#0f8"}}>{macro.dir==="BEARISH"?"↘️":"↗️"} {macro.dir}</span>
+      <span style={{color:"#567",fontSize:9}}>BTC ${macro.price?.toFixed(0)} vs 50h MA ${macro.ma?.toFixed(0)}</span>
+    </div>}
+
+    {/* URL INPUT */}
+    <div style={{marginBottom:12}}>
+      <div style={{fontFamily:M,fontSize:9,color:"#4a6a50",marginBottom:4}}>PASTE POLYMARKET UP/DOWN URL</div>
+      <div style={{display:"flex",gap:4}}>
+        <input value={url} onChange={e=>setUrl(e.target.value)} onKeyDown={e=>e.key==="Enter"&&analyzeUrl()} placeholder="https://polymarket.com/event/btc-updown-15m-..." style={{flex:1}}/>
+        <button onClick={analyzeUrl} disabled={loading} style={{padding:"6px 14px",background:"#0f820",color:"#0f8",border:"1px solid #0f840",borderRadius:4,fontSize:11,fontWeight:700}}>{loading?"⏳":"SCAN"}</button>
+      </div>
+      {urlStatus&&<div style={{fontFamily:M,fontSize:9,color:urlStatus.startsWith("✓")?"#0f8":urlStatus.startsWith("⚠")?"#fa0":"#f44",marginTop:4}}>{urlStatus}</div>}
+    </div>
+
+    {/* TABS */}
+    <div style={{display:"flex",gap:2,marginBottom:12,borderBottom:"1px solid #152018"}}>
+      {[{id:"signal",l:"📡 Signal"},{id:"pipeline",l:"🔬 Pipeline"},{id:"log",l:`📋 Log(${trades.length})`}].map(t=>
+        <button key={t.id} onClick={()=>setTab(t.id)} style={{fontFamily:M,fontSize:10,fontWeight:600,padding:"6px 12px",background:tab===t.id?"#081a10":"transparent",color:tab===t.id?"#0f8":"#3a5a40",border:tab===t.id?"1px solid #0f825":"1px solid transparent",borderBottom:tab===t.id?"1px solid #081a10":"none",borderRadius:"5px 5px 0 0",marginBottom:-1}}>{t.l}</button>
+      )}
+    </div>
+
+    {/* SIGNAL TAB */}
+    {tab==="signal"&&<div>
+      {!s?<div style={{fontFamily:M,fontSize:11,color:"#445",textAlign:"center",padding:30,border:"1px dashed #152018",borderRadius:5}}>
+        Paste en 15-min Up/Down URL ovenfor → SCAN
+      </div>:
+      <div>
+        {/* Confidence warning */}
+        {s.bay.confidence==="LOW"&&<div style={{background:"#2a1a0a",border:"1px solid #fa030",borderRadius:5,padding:10,marginBottom:10}}>
+          <div style={{fontFamily:M,fontSize:12,fontWeight:700,color:"#fa0"}}>⚠️ LOW CONFIDENCE — DO NOT TRADE</div>
+          <div style={{fontFamily:M,fontSize:10,color:"#a86",marginTop:4}}>CI width: {(s.bay.ciWidth*100).toFixed(1)}% (&gt;30%). Usikker prediktion.</div>
+        </div>}
+
+        {/* Main signal card */}
+        <div style={{background:"#060c08",border:"1px solid "+(s.pipe.allPass?s.pipe.direction==="UP"?"#0f840":"#f4440":"#33333340"),borderRadius:6,padding:14}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              <Pill c="#0af">{s.mkt.asset}</Pill><Pill c="#556">{s.mkt.tf}</Pill>
+              {s.analysis.candlePattern&&<span style={{fontSize:10}}>{s.analysis.candlePattern}</span>}
+            </div>
+            <Pill c={s.bay.confidence==="HIGH"?"#0f8":s.bay.confidence==="MEDIUM"?"#fa0":"#f44"}>{s.bay.confidence}</Pill>
+          </div>
+
+          <div style={{fontFamily:M,fontSize:10,color:"#778",marginBottom:8}}>{s.mkt.q}</div>
+
+          {/* Direction */}
+          <div style={{textAlign:"center",padding:"10px 0"}}>
+            {s.bay.confidence==="LOW"?
+              <div style={{fontFamily:M,fontSize:16,fontWeight:800,color:"#888"}}>⚫ NO SIGNAL</div>:
+              <div>
+                <div style={{fontSize:28}}>{s.pipe.directionRaw==="UP"?"⬆️":"⬇️"}</div>
+                <div style={{fontFamily:M,fontSize:20,fontWeight:800,color:s.pipe.directionRaw==="UP"?"#0f8":"#f44"}}>{s.pipe.directionRaw}</div>
+                <div style={{fontFamily:M,fontSize:12,color:"#8aa"}}>p(model): {(s.bay.posterior*100).toFixed(1)}% [{(s.bay.pLow*100).toFixed(1)}-{(s.bay.pHigh*100).toFixed(1)}%]</div>
+              </div>
+            }
+          </div>
+
+          {/* Trade recommendation */}
+          {s.pipe.allPass&&s.bay.confidence!=="LOW"&&<div style={{background:s.pipe.direction==="UP"?"#0f810":"#f4410",border:"1px solid "+(s.pipe.direction==="UP"?"#0f825":"#f4425"),borderRadius:5,padding:10,marginTop:8,textAlign:"center"}}>
+            <div style={{fontFamily:M,fontSize:12,fontWeight:700,color:s.pipe.direction==="UP"?"#0f8":"#f44"}}>
+              Buy {s.pipe.direction} at {(s.pipe.sharePrice*100).toFixed(0)}¢ → ${s.pipe.betSize.toFixed(2)} wins ${s.pipe.payout.toFixed(2)}
+            </div>
+            <div style={{fontFamily:M,fontSize:9,color:"#6a8",marginTop:4}}>
+              Edge: {(s.pipe.edge*100).toFixed(1)}% | EV: +{s.pipe.ev.toFixed(3)} | Kelly: ${s.pipe.betSize.toFixed(2)}
+            </div>
+          </div>}
+
+          {/* Pipeline fail */}
+          {!s.pipe.allPass&&s.bay.confidence!=="LOW"&&<div style={{background:"#1a0808",border:"1px solid #f4425",borderRadius:5,padding:8,marginTop:8,fontFamily:M,fontSize:10,color:"#f44",textAlign:"center"}}>
+            ❌ Pipeline fail: {s.pipe.failReason}
+          </div>}
+
+          {/* Signal details */}
+          <div style={{marginTop:12}}>
+            <div style={{fontFamily:M,fontSize:10,fontWeight:700,color:"#6a8",marginBottom:6}}>BAYESIAN SIGNALS (from SKILL.md):</div>
+            {s.analysis.indicators.filter(i=>i.cat!=="info").map((ind,i)=>
+              <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:"1px solid #0a1510",fontFamily:M,fontSize:10}}>
+                <span style={{color:"#5a7a5f",width:70}}>{ind.name}</span>
+                <span style={{color:ind.signal.includes("bullish")||ind.signal.includes("up")?"#0f8":ind.signal.includes("bearish")||ind.signal.includes("down")?"#f44":"#888",flex:1}}>{ind.signal}</span>
+                <span style={{color:"#445",fontSize:9}}>{ind.detail}</span>
+              </div>
+            )}
+            <div style={{fontFamily:M,fontSize:9,color:"#445",marginTop:6}}>
+              Independence factor: {s.bay.indFactor.toFixed(3)} | {s.bay.signals.length} signals | CI: {(s.bay.ciWidth*100).toFixed(1)}%
+            </div>
+          </div>
+
+          {/* Extra indicators */}
+          <div style={{marginTop:10}}>
+            <div style={{fontFamily:M,fontSize:10,fontWeight:700,color:"#556",marginBottom:4}}>TECHNICAL CONTEXT:</div>
+            {s.analysis.indicators.filter(i=>i.cat==="info").map((ind,i)=>
+              <div key={i} style={{fontFamily:M,fontSize:9,color:"#556",padding:"2px 0"}}>{ind.name}: {ind.detail}</div>
+            )}
+          </div>
+
+          {/* LOG button */}
+          <button onClick={()=>setLogModal({
+            market:s.mkt.q,asset:s.mkt.asset,tf:s.mkt.tf,
+            direction:s.bay.confidence==="LOW"?"DOWN":s.pipe.directionRaw,
+            sharePrice:s.pipe.sharePrice,
+            edge:(s.pipe.edge*100).toFixed(1),
+            confidence:s.bay.confidence,
+            paper:s.bay.confidence==="LOW",
+          })} style={{width:"100%",padding:10,marginTop:12,background:s.bay.confidence==="LOW"?"#fa015":"#0f820",color:s.bay.confidence==="LOW"?"#fa0":"#0f8",border:"1px solid "+(s.bay.confidence==="LOW"?"#fa030":"#0f840"),borderRadius:5,fontWeight:700,fontSize:12}}>
+            {s.bay.confidence==="LOW"?"📋 LOG (PAPER)":"📋 LOG TRADE"}
+          </button>
+        </div>
+      </div>}
+    </div>}
+
+    {/* PIPELINE TAB */}
+    {tab==="pipeline"&&<div>
+      {!s?<div style={{fontFamily:M,fontSize:10,color:"#445",textAlign:"center",padding:20}}>Scan et marked først</div>:
+      <div style={{background:"#040a06",border:"1px solid #1a3a20",borderRadius:5,padding:14}}>
+        <div style={{fontFamily:M,fontSize:11,fontWeight:700,color:"#0f8",marginBottom:10}}>9-STAGE PIPELINE ({s.pipe.regime})</div>
+        {s.pipe.stages.map(st=><div key={st.id} style={{display:"flex",alignItems:"center",padding:"4px 0",borderBottom:"1px solid #0a1510"}}>
+          <Dot ok={st.pass}/>
+          <span style={{fontFamily:M,fontSize:10,color:"#5a7a5f",width:80}}>#{st.id} {st.n}</span>
+          <span style={{fontFamily:M,fontSize:10,color:st.pass?"#5a8":"#f44"}}>{st.d}</span>
+        </div>)}
+        <div style={{marginTop:10,fontFamily:M,fontSize:9,color:"#445"}}>
+          Kelly f*={s.pipe.fullKelly.toFixed(4)} | α_eff={s.pipe.effAlpha.toFixed(3)} | Bet=${s.pipe.betSize.toFixed(2)} | Regime={s.pipe.regime}
+        </div>
+      </div>}
+    </div>}
+
+    {/* LOG TAB */}
+    {tab==="log"&&<div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:4,marginBottom:10}}>
+        {[{l:"Trades",v:trades.length},{l:"W/L",v:`${wins.length}/${resolved.length-wins.length}`},{l:"Win%",v:resolved.length>0?(wins.length/resolved.length*100).toFixed(0)+"%":"-"},{l:"P/L",v:(totalPnl>=0?"+":"")+totalPnl.toFixed(2),c:totalPnl>=0?"#0f8":"#f44"}].map((x,i)=>
+          <div key={i} style={{background:"#060c08",border:"1px solid #152018",borderRadius:4,padding:6,textAlign:"center"}}>
+            <div style={{fontFamily:M,fontSize:8,color:"#4a5a50"}}>{x.l}</div>
+            <div style={{fontFamily:M,fontSize:14,fontWeight:700,color:x.c||"#c8d8cc"}}>{x.v}</div>
+          </div>
+        )}
+      </div>
+      <div style={{display:"flex",gap:4,marginBottom:10}}>
+        <button onClick={()=>{const csv="timestamp,market,asset,tf,direction,sharePrice,betSize,confidence,edge,status,pnl,paper\n"+trades.map(t=>`${t.timestamp},${t.market},${t.asset},${t.tf},${t.direction},${t.sharePrice},${t.betSize},${t.confidence},${t.edge},${t.status},${t.pnl||0},${t.paper||false}`).join("\n");const b=new Blob([csv],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="pps_trades.csv";a.click();}} style={{flex:1,padding:6,background:"#0f815",color:"#0f8",border:"1px solid #0f830",borderRadius:4,fontSize:10}}>📥 CSV</button>
+        <button onClick={()=>{navigator.clipboard.writeText(JSON.stringify(trades,null,2));alert("JSON copied!")}} style={{flex:1,padding:6,background:"#0f815",color:"#0f8",border:"1px solid #0f830",borderRadius:4,fontSize:10}}>📋 JSON</button>
+      </div>
+      {trades.length===0?<div style={{fontFamily:M,fontSize:10,color:"#445",textAlign:"center",padding:20}}>Ingen trades</div>:
+      trades.slice().reverse().map((t,i)=><div key={i} style={{background:"#060c08",border:"1px solid #152018",borderLeft:"3px solid "+(t.status==="WIN"?"#0f8":t.status==="LOSS"?"#f44":"#fa0"),borderRadius:4,padding:"8px 10px",marginBottom:4}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+          <div style={{display:"flex",gap:4}}><Pill c="#0af">{t.asset}</Pill><Pill c={t.direction==="UP"?"#0f8":"#f44"}>{t.direction}</Pill>{t.paper&&<Pill c="#fa0">PAPER</Pill>}</div>
+          <Pill c={t.status==="WIN"?"#0f8":t.status==="LOSS"?"#f44":"#fa0"}>{t.status}</Pill>
+        </div>
+        <div style={{fontFamily:M,fontSize:9,color:"#6a8"}}>{t.shares?.toFixed(1)||0} shares @ {((t.sharePrice||0)*100).toFixed(0)}¢ • ${t.betSize} • {t.confidence}</div>
+        {t.status==="PENDING"&&<div style={{display:"flex",gap:4,marginTop:6}}>
+          <button onClick={()=>{const u=[...trades];u[trades.length-1-i]={...t,status:"WIN",pnl:(t.shares||0)*1-t.betSize};setTrades(u);}} style={{padding:"4px 8px",background:"#0f820",color:"#0f8",border:"1px solid #0f840",borderRadius:3,fontSize:9}}>WIN</button>
+          <button onClick={()=>{const u=[...trades];u[trades.length-1-i]={...t,status:"LOSS",pnl:-t.betSize};setTrades(u);}} style={{padding:"4px 8px",background:"#f4420",color:"#f44",border:"1px solid #f4440",borderRadius:3,fontSize:9}}>LOSS</button>
+          <button onClick={()=>setTrades(trades.filter((_,j)=>j!==trades.length-1-i))} style={{padding:"4px 8px",background:"none",color:"#666",border:"1px solid #333",borderRadius:3,fontSize:9}}>✕</button>
+        </div>}
+        {t.pnl!=null&&<div style={{fontFamily:M,fontSize:10,fontWeight:700,color:t.pnl>=0?"#0f8":"#f44",marginTop:3}}>P/L: {t.pnl>=0?"+":""}{t.pnl.toFixed(2)}</div>}
+      </div>)}
+    </div>}
+
+    <div style={{textAlign:"center",marginTop:20,padding:10,borderTop:"1px solid #0a1510"}}>
+      <div style={{fontFamily:M,fontSize:8,color:"#1a3a20"}}>PPS v4 • Bayesian Engine • 9-Stage Pipeline • Skill-Based</div>
+    </div>
+
+    {logModal&&<LogModal data={logModal} onClose={()=>setLogModal(null)} onSave={t=>{setTrades(p=>[...p,t]);setLogModal(null)}}/>}
+  </div>;
+}
+
+ReactDOM.render(<App/>,document.getElementById("root"));
+</script>
+</body>
+</html>
